@@ -1,8 +1,9 @@
-Mocha UEFI 是一个面向 Xiaomi Mi Pad 1（设备代号：Mocha）的 UEFI 启动与 Windows 移植实验项目。
+# Mocha UEFI 
+面向 Xiaomi Mi Pad 1（设备代号：Mocha）的 UEFI 启动与 Windows 移植实验项目。
 
 本项目旨在探索为该设备建立独立的 UEFI 启动环境，并尝试通过 UEFI 引导 Windows，逐步研究启动流程、系统交接以及设备兼容性。
 
-Project Status
+# Project Status
 
 <badge color="success">ExitBootServices reached</badge>
 
@@ -14,7 +15,7 @@ ExitBootServices = 0x0000000000000000
 
 返回值 "0" 对应 "EFI_SUCCESS"，表明本次 UEFI Boot Services 退出操作成功。
 
-Current Progress
+# Current Progress
 
 - [x] UEFI 启动程序运行
 - [x] 文件加载阶段
@@ -26,7 +27,7 @@ Current Progress
 - [ ] 设备硬件兼容性测试
 - [ ] Windows 系统运行测试
 
-Development
+# Development
 
 目前项目仍处于早期实验阶段。
 
@@ -34,7 +35,7 @@ Development
 
 接下来还需要一定时间进行研究、代码开发和实体设备测试，逐步解决 UEFI 与后续系统启动阶段之间的交接问题。
 
-Disclaimer
+# Disclaimer
 
 本项目目前仅完成部分 UEFI 启动流程验证
 
