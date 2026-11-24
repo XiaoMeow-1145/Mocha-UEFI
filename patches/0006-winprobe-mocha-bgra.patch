@@ -1,0 +1,109 @@
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -2304,6 +2304,17 @@
+ 	  Mount the build-provided GPT/FAT disk image in RAM and launch an
+ 	  ARM32 EFI application with its source device path.
+ 
++config MOCHA_WINPROBE_FB32
++	bool "Use a 32-bit linear GOP framebuffer for Mocha winprobe"
++	depends on CMD_MOCHA_WINPROBE && TARGET_MOCHA
++	depends on VIDEO_DSI_TEGRA && VIDEO_BPP32 && !VIDEO_COPY
++	help
++	  Enable 32-bit scanout for the Xiaomi Mi Pad 1 WinPE display
++	  handoff test. Both the Tegra display controller and EFI GOP
++	  use packed BGRX with blue at the lowest address in each pixel.
++	  The EFI memory map reserves the active scanout pages for
++	  continued use after ExitBootServices().
++
+ config CMD_BUTTON
+ 	bool "button"
+ 	depends on BUTTON
+diff --git a/drivers/video/tegra/dc.c b/drivers/video/tegra/dc.c
+--- a/drivers/video/tegra/dc.c
++++ b/drivers/video/tegra/dc.c
+@@ -51,9 +51,11 @@
+ 	/* Maximum LCD size we support */
+ 	LCD_MAX_WIDTH		= 2560,
+ 	LCD_MAX_HEIGHT		= 1600,
+-	LCD_MAX_LOG2_BPP	= VIDEO_BPP16,
+ };
+ 
++static const enum video_log2_bpp tegra_lcd_bpp =
++	IS_ENABLED(CONFIG_MOCHA_WINPROBE_FB32) ? VIDEO_BPP32 : VIDEO_BPP16;
++
+ static void update_window(struct tegra_lcd_priv *priv,
+ 			  struct disp_ctl_win *win)
+ {
+@@ -284,7 +286,11 @@
+ 
+ 	switch (priv->log2_bpp) {
+ 	case VIDEO_BPP32:
+-		win->fmt = COLOR_DEPTH_R8G8B8A8;
++		/* GOP BGRX stores blue in the lowest byte on Mocha. */
++		if (IS_ENABLED(CONFIG_MOCHA_WINPROBE_FB32))
++			win->fmt = COLOR_DEPTH_B8G8R8A8;
++		else
++			win->fmt = COLOR_DEPTH_R8G8B8A8;
+ 		win->bpp = 32;
+ 		break;
+ 	case VIDEO_BPP16:
+@@ -436,6 +442,8 @@
+ 	uc_priv->xsize = priv->width;
+ 	uc_priv->ysize = priv->height;
+ 	uc_priv->bpix = priv->log2_bpp;
++	if (IS_ENABLED(CONFIG_MOCHA_WINPROBE_FB32))
++		uc_priv->format = VIDEO_X8R8G8B8;
+ 	log_debug("LCD frame buffer at %08x, size %x\n", priv->frame_buffer,
+ 		  plat->size);
+ 
+@@ -636,17 +644,16 @@
+ 	priv->width = timing->hactive.typ;
+ 	priv->height = timing->vactive.typ;
+ 	priv->pixel_clock = timing->pixelclock.typ;
+-	priv->log2_bpp = VIDEO_BPP16;
++	priv->log2_bpp = tegra_lcd_bpp;
+ 
+ 	return 0;
+ }
+ 
+ static int tegra_lcd_bind(struct udevice *dev)
+ {
+ 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
+ 
+-	plat->size = LCD_MAX_WIDTH * LCD_MAX_HEIGHT *
+-		(1 << LCD_MAX_LOG2_BPP) / 8;
++	plat->size = LCD_MAX_WIDTH * LCD_MAX_HEIGHT * VNBYTES(tegra_lcd_bpp);
+ 
+ 	return dm_scan_fdt_dev(dev);
+ }
+diff --git a/lib/efi_loader/efi_gop.c b/lib/efi_loader/efi_gop.c
+--- a/lib/efi_loader/efi_gop.c
++++ b/lib/efi_loader/efi_gop.c
+@@ -506,7 +506,26 @@
+ 		return EFI_SUCCESS;
+ 	}
+ 
++	if (IS_ENABLED(CONFIG_MOCHA_WINPROBE_FB32)) {
++		/* The DC and GOP Blt both use tightly packed scan lines. */
++		if (bpix != VIDEO_BPP32 || format != VIDEO_X8R8G8B8 ||
++		    !fb_base || priv->line_length != col * VNBYTES(VIDEO_BPP32) ||
++		    priv->fb_size <= 0 || (u64)priv->fb_size > fb_size) {
++			log_err("Mocha GOP requires a packed 32-bit framebuffer\n");
++			return EFI_DEVICE_ERROR;
++		}
++		fb_size = priv->fb_size;
++
++		/* Preserve the active framebuffer across ExitBootServices. */
++		ret = efi_add_memory_map(fb_base, fb_size,
++					 EFI_RESERVED_MEMORY_TYPE);
++		if (ret != EFI_SUCCESS) {
++			log_err("Cannot reserve the Mocha GOP framebuffer\n");
++			return ret;
++		}
++	}
++
+ 	gopobj = calloc(1, sizeof(*gopobj));
+ 	if (!gopobj) {
+ 		printf("ERROR: Out of memory\n");
+ 		return EFI_OUT_OF_RESOURCES;

@@ -1,0 +1,62 @@
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -2297,6 +2297,13 @@
+ 	    boundary. A common example is a filesystem image embedded in an FIT
+ 	    image.
+ 
++config CMD_MOCHA_WINPROBE
++	bool "winprobe - run an ARM32 EFI application from an embedded RAM disk"
++	depends on ARM && !ARM64 && EFI_LOADER && BLKMAP && GZIP
++	help
++	  Mount the build-provided GPT/FAT disk image in RAM and launch an
++	  ARM32 EFI application with its source device path.
++
+ config CMD_BUTTON
+ 	bool "button"
+ 	depends on BUTTON
+diff --git a/cmd/Makefile b/cmd/Makefile
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -32,6 +32,8 @@
+ obj-$(CONFIG_CMD_BLKMAP) += blkmap.o
+ obj-$(CONFIG_CMD_BLOBLIST) += bloblist.o
+ obj-$(CONFIG_CMD_BLOCK_CACHE) += blkcache.o
++obj-$(CONFIG_CMD_MOCHA_WINPROBE) += mocha_winprobe.o mocha_winacpi.o
++$(obj)/mocha_winprobe.o: $(obj)/mocha_winprobe_disk.gz
+ obj-$(CONFIG_CMD_BMP) += bmp.o
+ obj-$(CONFIG_CMD_BOOTCOUNT) += bootcount.o
+ obj-$(CONFIG_CMD_BOOTEFI) += bootefi.o
+diff --git a/lib/efi_loader/efi_boottime.c b/lib/efi_loader/efi_boottime.c
+--- a/lib/efi_loader/efi_boottime.c
++++ b/lib/efi_loader/efi_boottime.c
+@@ -2270,6 +2270,9 @@
+ 		if (ret != EFI_SUCCESS)
+ 			efi_tcg2_notify_exit_boot_services_failed();
+ 	}
++	if (IS_ENABLED(CONFIG_CMD_MOCHA_WINPROBE))
++		printf("WINPROBE ExitBootServices = 0x%016llx\n",
++		       (unsigned long long)ret);
+ 
+ 	return EFI_EXIT(ret);
+ }
+@@ -3274,6 +3277,8 @@
+ 	image_obj->header.type = EFI_OBJECT_TYPE_STARTED_IMAGE;
+ 	EFI_PRINT("Starting image loaded at 0x%p, entry point 0x%p\n",
+ 		  info->image_base, image_obj->entry);
++	if (IS_ENABLED(CONFIG_CMD_MOCHA_WINPROBE))
++		printf("WINPROBE EFI dispatch entry=%p\n", image_obj->entry);
+ 	ret = EFI_CALL(image_obj->entry(image_handle, &systab));
+ 
+ 	/*
+diff --git a/lib/efi_loader/efi_file.c b/lib/efi_loader/efi_file.c
+--- a/lib/efi_loader/efi_file.c
++++ b/lib/efi_loader/efi_file.c
+@@ -325,4 +325,7 @@
+ 	ret = efi_file_open_int(this, new_handle, file_name, open_mode,
+ 				attributes);
++	if (IS_ENABLED(CONFIG_CMD_MOCHA_WINPROBE) && file_name)
++		printf("WINPROBE Open %ls = 0x%016llx\n", file_name,
++		       (unsigned long long)ret);
+ 
+ 	return EFI_EXIT(ret);

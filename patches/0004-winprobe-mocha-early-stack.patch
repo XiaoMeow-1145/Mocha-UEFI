@@ -1,0 +1,15 @@
+diff --git a/arch/arm/lib/crt0.S b/arch/arm/lib/crt0.S
+--- a/arch/arm/lib/crt0.S
++++ b/arch/arm/lib/crt0.S
+@@ -100,7 +100,10 @@
+  * Set up initial C runtime environment and call board_init_f(0).
+  */
+ 
+-#if CONFIG_IS_ENABLED(HAVE_INIT_STACK)
++#if !defined(CONFIG_XPL_BUILD) && defined(CONFIG_TARGET_MOCHA) && defined(CONFIG_CMD_MOCHA_WINPROBE)
++	/* The vendor-loaded WinPE image can span the default Tegra stack. */
++	ldr	r0, =winprobe_early_stack_top
++#elif CONFIG_IS_ENABLED(HAVE_INIT_STACK)
+ 	ldr	r0, =CONFIG_VAL(STACK)
+ #else
+ 	ldr	r0, =(SYS_INIT_SP_ADDR)

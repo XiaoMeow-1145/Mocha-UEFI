@@ -1,0 +1,99 @@
+diff --git a/lib/efi_loader/efi_boottime.c b/lib/efi_loader/efi_boottime.c
+--- a/lib/efi_loader/efi_boottime.c
++++ b/lib/efi_loader/efi_boottime.c
+@@ -24,6 +24,12 @@
+ #include <watchdog.h>
+ #include <asm/global_data.h>
+ #include <linux/libfdt_env.h>
++
++#if defined(CONFIG_ARM) && !defined(CONFIG_ARM64) && defined(CONFIG_CMD_MOCHA_WINPROBE)
++#include <asm/proc-armv/ptrace.h>
++#include <asm/system.h>
++#define MOCHA_WINPROBE_ARM32_TRACE
++#endif
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -2162,6 +2168,34 @@
+ #endif
+ }
+ 
++#ifdef MOCHA_WINPROBE_ARM32_TRACE
++static unsigned long winprobe_ebs_cpsr;
++static unsigned int winprobe_ebs_sctlr;
++
++static void winprobe_arm32_image_return(const char *path, efi_status_t status)
++{
++	unsigned long cpsr;
++
++	if (systab.boottime) {
++		printf("WINPROBE EFI image %s status=0x%08lx\n", path, status);
++		return;
++	}
++
++	/* Only attempt console output in the same physical execution state. */
++	cpsr = get_cpsr();
++	if ((cpsr & MODE_MASK) == SVC_MODE &&
++	    !((cpsr ^ winprobe_ebs_cpsr) & GENMASK(9, 0)) &&
++	    !(winprobe_ebs_sctlr & CR_M) && get_cr() == winprobe_ebs_sctlr &&
++	    gd && (gd->flags & GD_FLG_HAVE_CONSOLE))
++		printf("WINPROBE EFI image %s after EBS status=0x%08lx\n",
++		       path, status);
++
++	/* Boot-service memory and devices may now belong to the payload. */
++	for (;;)
++		;
++}
++#endif
++
+ /**
+  * efi_exit_boot_services() - stop all boot services
+  * @image_handle: handle of the loaded image
+@@ -2247,8 +2281,16 @@
+ 	/* Patch out unsupported runtime function */
+ 	efi_runtime_detach();
+ 
++#ifdef MOCHA_WINPROBE_ARM32_TRACE
++	printf("WINPROBE EBS before cache: image=%p key=%zx cpsr=%08lx sctlr=%08x\n",
++	       image_handle, map_key, get_cpsr(), get_cr());
++#endif
+ 	/* Fix up caches for EFI payloads if necessary */
+ 	efi_exit_caches();
++#ifdef MOCHA_WINPROBE_ARM32_TRACE
++	printf("WINPROBE EBS after cache: cpsr=%08lx sctlr=%08x\n",
++	       get_cpsr(), get_cr());
++#endif
+ 
+ 	/* Disable boot time services */
+ 	systab.con_in_handle = NULL;
+@@ -2265,6 +2307,10 @@
+ 	/* Give the payload some time to boot */
+ 	efi_set_watchdog(0);
+ 	schedule();
++#ifdef MOCHA_WINPROBE_ARM32_TRACE
++	winprobe_ebs_cpsr = get_cpsr();
++	winprobe_ebs_sctlr = get_cr();
++#endif
+ out:
+ 	if (IS_ENABLED(CONFIG_EFI_TCG2_PROTOCOL)) {
+ 		if (ret != EFI_SUCCESS)
+@@ -3267,6 +3313,9 @@
+ 		 * missed out steps of EFI_CALL.
+ 		 */
+ 		EFI_RETURN(exit_status);
++#ifdef MOCHA_WINPROBE_ARM32_TRACE
++		winprobe_arm32_image_return("Exit() unwind", exit_status);
++#endif
+ 
+ 		current_image = parent_image;
+ 
+@@ -3280,6 +3329,9 @@
+ 	if (IS_ENABLED(CONFIG_CMD_MOCHA_WINPROBE))
+ 		printf("WINPROBE EFI dispatch entry=%p\n", image_obj->entry);
+ 	ret = EFI_CALL(image_obj->entry(image_handle, &systab));
++#ifdef MOCHA_WINPROBE_ARM32_TRACE
++	winprobe_arm32_image_return("entry return", ret);
++#endif
+ 
+ 	/*
+ 	 * Control is returned from a started UEFI image either by calling

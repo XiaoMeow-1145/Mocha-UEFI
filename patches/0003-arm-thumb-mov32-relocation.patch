@@ -1,0 +1,253 @@
+diff --git a/lib/efi_loader/efi_image_loader.c b/lib/efi_loader/efi_image_loader.c
+--- a/lib/efi_loader/efi_image_loader.c
++++ b/lib/efi_loader/efi_image_loader.c
+@@ -16,6 +16,7 @@
+ #include <mapmem.h>
+ #include <pe.h>
+ #include <sort.h>
++#include <asm/unaligned.h>
+ #include <crypto/mscode.h>
+ #include <crypto/pkcs7_parser.h>
+ #include <linux/err.h>
+@@ -101,58 +102,158 @@
+ 	}
+ }
+ 
++#ifdef __arm__
++static u16 efi_thumb_mov_imm16(u16 first, u16 second)
++{
++	/* imm16 = imm4:i:imm3:imm8 */
++	return ((first & 0x000f) << 12) | ((first & 0x0400) << 1) |
++	       ((second & 0x7000) >> 4) | (second & 0x00ff);
++}
++
++static void efi_thumb_mov_set_imm16(u8 *insn, u16 first, u16 second, u16 imm)
++{
++	first = (first & ~0x040f) | (imm >> 12) | ((imm >> 1) & 0x0400);
++	second = (second & ~0x70ff) | ((imm << 4) & 0x7000) | (imm & 0x00ff);
++	put_unaligned_le16(first, insn);
++	put_unaligned_le16(second, insn + 2);
++}
++
++static bool efi_arm_relocate_mov32t(u8 *fixup, u32 delta)
++{
++	/* Thumb-2 stores the first halfword first, each in little-endian. */
++	u16 movw1 = get_unaligned_le16(fixup);
++	u16 movw2 = get_unaligned_le16(fixup + 2);
++	u16 movt1 = get_unaligned_le16(fixup + 4);
++	u16 movt2 = get_unaligned_le16(fixup + 6);
++	u16 rd = movw2 & 0x0f00;
++	u32 addr;
++
++	/* Validate MOVW then MOVT to the same register, with PC reserved. */
++	if ((movw1 & 0xfbf0) != 0xf240 || (movt1 & 0xfbf0) != 0xf2c0 ||
++	    ((movw2 | movt2) & 0x8000) || rd != (movt2 & 0x0f00) ||
++	    rd == 0x0f00)
++		return false;
++
++	addr = efi_thumb_mov_imm16(movw1, movw2) |
++	       ((u32)efi_thumb_mov_imm16(movt1, movt2) << 16);
++	addr += delta;
++	efi_thumb_mov_set_imm16(fixup, movw1, movw2, (u16)addr);
++	efi_thumb_mov_set_imm16(fixup + 4, movt1, movt2, addr >> 16);
++
++	return true;
++}
++#endif
++
+ /**
+  * efi_loader_relocate() - relocate UEFI binary
+  *
+- * @rel:		pointer to the relocation table
++ * @rel_rva:		image-relative address of the relocation table
+  * @rel_size:		size of the relocation table in bytes
+  * @efi_reloc:		actual load address of the image
++ * @image_size:		virtual size of the loaded image
+  * @pref_address:	preferred load address of the image
+  * Return:		status code
+  */
+-static efi_status_t efi_loader_relocate(const IMAGE_BASE_RELOCATION *rel,
+-			unsigned long rel_size, void *efi_reloc,
+-			unsigned long pref_address)
++static efi_status_t efi_loader_relocate(u32 rel_rva, unsigned long rel_size,
++				       void *efi_reloc, size_t image_size,
++				       unsigned long pref_address)
+ {
+ 	unsigned long delta = (unsigned long)efi_reloc - pref_address;
+-	const IMAGE_BASE_RELOCATION *end;
+-	int i;
++	const size_t header_size = sizeof(IMAGE_BASE_RELOCATION);
++	const u8 *rel;
+ 
+-	if (delta == 0)
++	if (!delta || !rel_size)
+ 		return EFI_SUCCESS;
+ 
+-	end = (const IMAGE_BASE_RELOCATION *)((const char *)rel + rel_size);
+-	while (rel + 1 < end && rel->SizeOfBlock) {
+-		const uint16_t *relocs = (const uint16_t *)(rel + 1);
+-		i = (rel->SizeOfBlock - sizeof(*rel)) / sizeof(uint16_t);
++	if (rel_rva > image_size || rel_size > image_size - rel_rva) {
++		log_err("Base relocation directory outside image\n");
++		return EFI_LOAD_ERROR;
++	}
++
++	rel = efi_reloc + rel_rva;
++	while (rel_size >= header_size) {
++		const u8 *relocs = rel + header_size;
++		u32 block_size, page_rva;
++		unsigned int i;
++
++		block_size = get_unaligned_le32(rel +
++				offsetof(IMAGE_BASE_RELOCATION, SizeOfBlock));
++		if (!block_size)
++			return EFI_SUCCESS;
++		if (block_size < header_size || block_size > rel_size ||
++		    !IS_ALIGNED(block_size, sizeof(u16))) {
++			log_err("Invalid base relocation block size %x\n", block_size);
++			return EFI_LOAD_ERROR;
++		}
++
++		page_rva = get_unaligned_le32(rel +
++				offsetof(IMAGE_BASE_RELOCATION, VirtualAddress));
++		i = (block_size - header_size) / sizeof(u16);
+ 		while (i--) {
+-			uint32_t offset = (uint32_t)(*relocs & 0xfff) +
+-					  rel->VirtualAddress;
+-			int type = *relocs >> EFI_PAGE_SHIFT;
+-			uint64_t *x64 = efi_reloc + offset;
+-			uint32_t *x32 = efi_reloc + offset;
+-			uint16_t *x16 = efi_reloc + offset;
++			u16 entry = get_unaligned_le16(relocs);
++			u64 offset = (u64)page_rva + (entry & EFI_PAGE_MASK);
++			int type = entry >> EFI_PAGE_SHIFT;
++			size_t available;
++			void *fixup;
++
++			relocs += sizeof(entry);
++			if (type == IMAGE_REL_BASED_ABSOLUTE)
++				continue;
++			if (offset >= image_size) {
++				log_err("Base relocation target outside image: %llx\n",
++					(unsigned long long)offset);
++				return EFI_LOAD_ERROR;
++			}
+ 
++			fixup = efi_reloc + (size_t)offset;
++			available = image_size - (size_t)offset;
+ 			switch (type) {
+-			case IMAGE_REL_BASED_ABSOLUTE:
+-				break;
+ 			case IMAGE_REL_BASED_HIGH:
+-				*x16 += ((uint32_t)delta) >> 16;
++				if (available < sizeof(u16))
++					return EFI_LOAD_ERROR;
++				put_unaligned_le16(get_unaligned_le16(fixup) +
++						   ((u32)delta >> 16), fixup);
+ 				break;
+ 			case IMAGE_REL_BASED_LOW:
+-				*x16 += (uint16_t)delta;
++				if (available < sizeof(u16))
++					return EFI_LOAD_ERROR;
++				put_unaligned_le16(get_unaligned_le16(fixup) + (u16)delta,
++						   fixup);
+ 				break;
+ 			case IMAGE_REL_BASED_HIGHLOW:
+-				*x32 += (uint32_t)delta;
++				if (available < sizeof(u32))
++					return EFI_LOAD_ERROR;
++				put_unaligned_le32(get_unaligned_le32(fixup) + (u32)delta,
++						   fixup);
+ 				break;
+ 			case IMAGE_REL_BASED_DIR64:
+-				*x64 += (uint64_t)delta;
++				if (available < sizeof(u64))
++					return EFI_LOAD_ERROR;
++				put_unaligned_le64(get_unaligned_le64(fixup) + (u64)delta,
++						   fixup);
++				break;
++#if defined(__arm__)
++			case IMAGE_REL_BASED_ARM_MOV32T:
++				if (!IS_ALIGNED(offset, sizeof(u16)) ||
++				    available < 4 * sizeof(u16) ||
++				    !efi_arm_relocate_mov32t(fixup, (u32)delta)) {
++					log_err("Invalid ARM MOV32T relocation at %x\n",
++						(u32)offset);
++					return EFI_LOAD_ERROR;
++				}
+ 				break;
+-#ifdef __riscv
+-			case IMAGE_REL_BASED_RISCV_HI20:
+-				*x32 = ((*x32 & 0xfffff000) + (uint32_t)delta) |
++#elif defined(__riscv)
++			case IMAGE_REL_BASED_RISCV_HI20: {
++				u32 value;
++
++				if (available < sizeof(u32))
++					return EFI_LOAD_ERROR;
++				value = get_unaligned_le32(fixup);
++				value = ((value & 0xfffff000) + (u32)delta) |
++					(value & 0x00000fff);
++				put_unaligned_le32(value, fixup);
+-					(*x32 & 0x00000fff);
+ 				break;
++			}
+ 			case IMAGE_REL_BASED_RISCV_LOW12I:
+ 			case IMAGE_REL_BASED_RISCV_LOW12S:
+ 				/* We know that we're 4k aligned */
+@@ -164,12 +265,16 @@
+ #endif
+ 			default:
+ 				log_err("Unknown Relocation off %x type %x\n",
+-					offset, type);
++					(u32)offset, type);
+ 				return EFI_LOAD_ERROR;
+ 			}
+-			relocs++;
+ 		}
+-		rel = (const IMAGE_BASE_RELOCATION *)relocs;
++		rel += block_size;
++		rel_size -= block_size;
++	}
++	if (rel_size) {
++		log_err("Truncated base relocation block header\n");
++		return EFI_LOAD_ERROR;
+ 	}
+ 	return EFI_SUCCESS;
+ }
+@@ -839,7 +944,7 @@
+ 	int num_sections;
+ 	void *efi_reloc;
+ 	int i;
+-	const IMAGE_BASE_RELOCATION *rel;
++	u32 rel_rva;
+ 	unsigned long rel_size;
+ 	int rel_idx = IMAGE_DIRECTORY_ENTRY_BASERELOC;
+ 	uint64_t image_base;
+@@ -908,7 +1013,7 @@
+ 		}
+ 		handle->entry = efi_reloc + opt->AddressOfEntryPoint;
+ 		rel_size = opt->DataDirectory[rel_idx].Size;
+-		rel = efi_reloc + opt->DataDirectory[rel_idx].VirtualAddress;
++		rel_rva = opt->DataDirectory[rel_idx].VirtualAddress;
+ 	} else if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+ 		IMAGE_OPTIONAL_HEADER32 *opt = &nt->OptionalHeader;
+ 		image_base = opt->ImageBase;
+@@ -924,7 +1029,7 @@
+ 		}
+ 		handle->entry = efi_reloc + opt->AddressOfEntryPoint;
+ 		rel_size = opt->DataDirectory[rel_idx].Size;
+-		rel = efi_reloc + opt->DataDirectory[rel_idx].VirtualAddress;
++		rel_rva = opt->DataDirectory[rel_idx].VirtualAddress;
+ 	} else {
+ 		log_err("Invalid optional header magic %x\n",
+ 			nt->OptionalHeader.Magic);
+@@ -969,7 +1074,7 @@
+ 	}
+ 
+ 	/* Run through relocations */
+-	if (efi_loader_relocate(rel, rel_size, efi_reloc,
++	if (efi_loader_relocate(rel_rva, rel_size, efi_reloc, virt_size,
+ 				(unsigned long)image_base) != EFI_SUCCESS) {
+ 		efi_free_pages((uintptr_t) efi_reloc,
+ 			       (virt_size + EFI_PAGE_MASK) >> EFI_PAGE_SHIFT);
